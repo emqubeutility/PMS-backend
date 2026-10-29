@@ -10,7 +10,11 @@ const option = {
     code: { type: ['string', 'null'] },
     email: { type: ['string', 'null'] },
     groupId: { type: 'integer' },
+    divisionId: { type: ['integer', 'null'] },
+    siteId: { type: 'integer' },
+    isActive: { type: 'boolean' },
     costPerHour: { type: ['number', 'null'] },
+    ratePerHour: { type: 'number' },
     currency: { type: ['string', 'null'] },
     gradeName: { type: ['string', 'null'] },
     teamName: { type: ['string', 'null'] },
@@ -25,22 +29,33 @@ const activeQuery = {
 
 const LISTS = {
   'project-divisions': `SELECT id, name FROM project_divisions WHERE is_active OR $1 ORDER BY name`,
-  'project-types': `SELECT id, name FROM project_types WHERE is_active OR $1 ORDER BY name`,
+  'project-types': `SELECT id, name, project_division_id AS "divisionId" FROM project_types WHERE is_active OR $1 ORDER BY name`,
   customers: `SELECT id, name, code FROM customers WHERE is_active OR $1 ORDER BY name`,
+  // quote rate per hour of each division per currency (project estimated hours = amount / rate)
+  'quote-rates': `SELECT id, trim(currency) AS name, project_division_id AS "divisionId", trim(currency) AS currency, rate_per_hour AS "ratePerHour"
+                    FROM project_division_quote_rates ORDER BY project_division_id, currency`,
   sites: `SELECT id, name FROM sites WHERE is_active OR $1 ORDER BY name`,
-  // "Dubai Shift (08:30 - 18:00)" like the old screens; shifts have no active flag
-  shifts: `SELECT id, name || ' (' || to_char(start_time, 'HH24:MI') || ' - ' || to_char(end_time, 'HH24:MI') || ')' AS name
-             FROM shifts ORDER BY start_time, name`,
+  // "Morning Shift (09:00 - 18:00)" with its site, for the user form's Shift dropdown
+  'site-shifts': `SELECT ss.id, ss.name || ' (' || to_char(ss.start_time, 'HH24:MI') || ' - ' || to_char(ss.end_time, 'HH24:MI') || ')' AS name,
+                         ss.site_id AS "siteId", ss.is_active AND s.is_active AS "isActive"
+                    FROM site_shifts ss JOIN sites s ON s.id = ss.site_id
+                   WHERE (ss.is_active AND s.is_active) OR $1 ORDER BY ss.display_order, ss.start_time, ss.name`,
   // grade, team position and hourly rate fill the project Users tab when a member is added
-  users: `SELECT u.id, u.name, u.emp_code AS code, u.email, g.name AS grade_name, tm.name AS team_name,
+  users: `SELECT u.id, u.name, u.emp_code AS code, u.email, g.name AS grade_name,
+                 (SELECT t.name FROM user_teams ut JOIN teams t ON t.id = ut.team_id WHERE ut.user_id = u.id ORDER BY ut.team_id LIMIT 1) AS team_name,
                  u.hourly_rate AS cost_per_hour, u.hourly_rate_currency AS currency,
                  (SELECT ut.position FROM user_teams ut WHERE ut.user_id = u.id AND ut.position IS NOT NULL ORDER BY ut.team_id LIMIT 1) AS position
             FROM users u
             LEFT JOIN resource_grades rg ON rg.id = u.resource_grade_id
             LEFT JOIN lookups g ON g.id = rg.grade_id
-            LEFT JOIN teams tm ON tm.id = rg.team_id
            WHERE u.is_active OR $1 ORDER BY u.name`,
   'task-groups': `SELECT id, name FROM task_groups ORDER BY name`,
+  // groups a project estimate / project type template can use: the ones of a project category, or of no category yet
+  'project-task-groups': `SELECT g.id, g.name FROM task_groups g
+                           WHERE EXISTS (SELECT 1 FROM task_category_groups l JOIN task_categories c ON c.id = l.task_category_id WHERE l.task_group_id = g.id AND c.is_project)
+                              OR NOT EXISTS (SELECT 1 FROM task_category_groups l WHERE l.task_group_id = g.id)
+                           ORDER BY g.name`,
+  'task-categories': `SELECT id, name FROM task_categories WHERE is_active OR $1 ORDER BY display_order, name`,
   teams: `SELECT id, name FROM teams ORDER BY name`,
 };
 
@@ -88,12 +103,10 @@ export default async function mastersRoutes(fastify) {
     async () =>
       (
         await db.query(
-          // "SW India (Level C)" – team first, like the old screens; team-less grades show the grade only
-          `SELECT x.id, CASE WHEN t.name IS NULL THEN g.name ELSE t.name || ' (' || g.name || ')' END AS name,
-                  cc.cost_per_hour AS "costPerHour", trim(cc.currency) AS currency
-             FROM resource_grades x JOIN lookups g ON g.id = x.grade_id LEFT JOIN teams t ON t.id = x.team_id
+          `SELECT x.id, g.name, cc.cost_per_hour AS "costPerHour", trim(cc.currency) AS currency
+             FROM resource_grades x JOIN lookups g ON g.id = x.grade_id
              ${CURRENT_COST}
-            ORDER BY t.name NULLS FIRST, g.display_order, g.name`,
+            ORDER BY g.display_order, g.name`,
         )
       ).rows,
   );

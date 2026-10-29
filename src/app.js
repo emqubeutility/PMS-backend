@@ -14,6 +14,10 @@ import projectsRoutes from './modules/projects/projects.routes.js';
 import mastersRoutes from './modules/masters/masters.routes.js';
 import configRoutes from './modules/config/config.routes.js';
 import timesheetsRoutes from './modules/timesheets/timesheets.routes.js';
+import tasksRoutes from './modules/tasks/tasks.routes.js';
+import task135Routes from './modules/task135/task135.routes.js';
+import taskAccessRoutes from './modules/taskaccess/taskaccess.routes.js';
+import projectPlanRoutes from './modules/projectplan/projectplan.routes.js';
 
 export async function buildApp(opts = {}) {
   const app = Fastify({
@@ -48,9 +52,13 @@ export async function buildApp(opts = {}) {
       await api.register(rolesRoutes, { prefix: '/roles' });
       await api.register(menusRoutes, { prefix: '/menus' });
       await api.register(projectsRoutes, { prefix: '/projects' });
+      await api.register(projectPlanRoutes, { prefix: '/projects' }); // Plan tab: /projects/:id/plan
       await api.register(mastersRoutes, { prefix: '/masters' });
       await api.register(configRoutes, { prefix: '/config' });
       await api.register(timesheetsRoutes, { prefix: '/timesheets' });
+      await api.register(tasksRoutes, { prefix: '/tasks' });
+      await api.register(taskAccessRoutes, { prefix: '/task-access' });
+      await api.register(task135Routes, { prefix: '/task-135' });
     },
     { prefix: '/api/v1' },
   );

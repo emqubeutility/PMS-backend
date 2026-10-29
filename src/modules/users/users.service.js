@@ -19,26 +19,27 @@ const FIELDS = {
   reportsTo: 'reports_to',
   reviewedBy: 'reviewed_by',
   siteId: 'site_id',
-  shiftId: 'shift_id',
+  siteShiftId: 'site_shift_id',
   resourceGradeId: 'resource_grade_id',
   timeZone: 'time_zone',
   isOnLeave: 'is_on_leave',
-  hourlyRate: 'hourly_rate',
-  hourlyRateCurrency: 'hourly_rate_currency',
   customerId: 'customer_id',
   vendorId: 'vendor_id',
 };
 
 const SELECT = `
-  SELECT u.*, r.name AS role_name, r.level AS role_level,
+  SELECT u.*, r.name AS role_name, r.level AS role_level, r.code AS role_code,
+         COALESCE((SELECT json_agg(json_build_object('id', l.id, 'name', l.name) ORDER BY l.display_order, l.name)
+                     FROM user_skills us JOIN lookups l ON l.id = us.skill_id WHERE us.user_id = u.id), '[]') AS skills,
          rt.name AS reports_to_name, rv.name AS reviewed_by_name,
-         s.name AS site_name, sh.name AS shift_name, ut.name AS user_type_name, c.name AS customer_name
+         s.name AS site_name,
+         ss.name || ' (' || to_char(ss.start_time, 'HH24:MI') || ' - ' || to_char(ss.end_time, 'HH24:MI') || ')' AS site_shift, ut.name AS user_type_name, c.name AS customer_name
     FROM users u
     JOIN roles r ON r.id = u.role_id
     LEFT JOIN users rt ON rt.id = u.reports_to
     LEFT JOIN users rv ON rv.id = u.reviewed_by
     LEFT JOIN sites s ON s.id = u.site_id
-    LEFT JOIN shifts sh ON sh.id = u.shift_id
+    LEFT JOIN site_shifts ss ON ss.id = u.site_shift_id
     LEFT JOIN lookups ut ON ut.id = u.user_type_id
     LEFT JOIN customers c ON c.id = u.customer_id`;
 
@@ -52,6 +53,8 @@ const toDto = (u) => ({
   roleId: u.role_id,
   roleName: u.role_name,
   roleLevel: u.role_level,
+  roleCode: u.role_code,
+  skills: u.skills ?? [],
   userTypeId: u.user_type_id,
   userTypeName: u.user_type_name,
   reportsTo: u.reports_to,
@@ -60,12 +63,10 @@ const toDto = (u) => ({
   reviewedByName: u.reviewed_by_name,
   siteId: u.site_id,
   siteName: u.site_name,
-  shiftId: u.shift_id,
-  shiftName: u.shift_name,
+  siteShiftId: u.site_shift_id,
+  siteShift: u.site_shift ?? null,
   resourceGradeId: u.resource_grade_id,
   timeZone: u.time_zone,
-  hourlyRate: u.hourly_rate,
-  hourlyRateCurrency: u.hourly_rate_currency?.trim() ?? null,
   customerId: u.customer_id,
   customerName: u.customer_name,
   vendorId: u.vendor_id,
@@ -88,8 +89,6 @@ export async function listUsers(db, q, maxFailedLogins) {
   if (roleIds.length) where.add(`u.role_id = ANY($?)`, roleIds);
   const siteIds = idList(q.siteId);
   if (siteIds.length) where.add(`u.site_id = ANY($?)`, siteIds);
-  const shiftIds = idList(q.shiftId);
-  if (shiftIds.length) where.add(`u.shift_id = ANY($?)`, shiftIds);
   const reportsTo = idList(q.reportsTo);
   if (reportsTo.length) where.add(`u.reports_to = ANY($?)`, reportsTo);
   const userTypes = idList(q.userTypeId);
@@ -167,6 +166,37 @@ async function nextEmpCode(client) {
   return `EMP-${rows[0].n}`;
 }
 
+/** The shift must be one of the user's site's shifts (no site → no shift). */
+async function checkShift(db, siteId, shiftId) {
+  if (shiftId == null) return;
+  if (siteId == null) throw badRequest('Select the site before the shift', [{ field: 'siteShiftId', message: 'no site selected' }]);
+  const { rowCount } = await db.query(`SELECT 1 FROM site_shifts WHERE id = $1 AND site_id = $2`, [shiftId, siteId]);
+  if (!rowCount) throw badRequest('The selected shift is not a shift of the selected site', [{ field: 'siteShiftId', message: 'not in this site' }]);
+}
+
+/** Roles whose users have skills (Parameters → SKILL). */
+export const SKILL_ROLES = ['EMPLOYEE', 'PROJECT_MANAGER'];
+
+/**
+ * Saves the user's skills: only for the Employee / Project Manager roles – any other role clears them.
+ * Without skillIds the skills are left alone (unless the new role has none).
+ */
+async function saveSkills(client, userId, roleId, skillIds) {
+  const { rows } = await client.query(`SELECT code FROM roles WHERE id = $1`, [roleId]);
+  if (!SKILL_ROLES.includes(rows[0]?.code)) {
+    await client.query(`DELETE FROM user_skills WHERE user_id = $1`, [userId]);
+    return;
+  }
+  if (!Array.isArray(skillIds)) return;
+  const ids = [...new Set(skillIds)];
+  if (ids.length) {
+    const { rows: found } = await client.query(`SELECT id FROM lookups WHERE id = ANY($1) AND type = 'SKILL'`, [ids]);
+    if (found.length !== ids.length) throw badRequest('A selected skill does not exist (Parameters → SKILL)', [{ field: 'skillIds', message: 'unknown skill' }]);
+  }
+  await client.query(`DELETE FROM user_skills WHERE user_id = $1`, [userId]);
+  if (ids.length) await client.query(`INSERT INTO user_skills (user_id, skill_id) SELECT $1, unnest($2::bigint[])`, [userId, ids]);
+}
+
 function pickColumns(body) {
   const cols = [];
   const vals = [];
@@ -181,11 +211,13 @@ function pickColumns(body) {
 
 export async function createUser(db, auth, body, maxFailedLogins) {
   assertCanManageLevel(auth, await getRoleLevel(db, body.roleId));
+  await checkShift(db, body.siteId ?? null, body.siteShiftId ?? null);
   const passwordHash = await hashPassword(body.password);
 
   const id = await db.tx(async (client) => {
     const data = { ...body };
     delete data.password;
+    delete data.skillIds;
     if (!data.empCode?.trim()) data.empCode = await nextEmpCode(client);
     const { cols, vals } = pickColumns(data);
     cols.push('password_hash', 'created_by', 'updated_by');
@@ -194,6 +226,7 @@ export async function createUser(db, auth, body, maxFailedLogins) {
       `INSERT INTO users (${cols.join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING id, username`,
       vals,
     );
+    await saveSkills(client, rows[0].id, body.roleId, body.skillIds);
     await writeAudit(client, { entity: 'users', entityId: rows[0].id, action: 'create', userId: auth.userId, message: `User ${rows[0].username} created` });
     return rows[0].id;
   });
@@ -216,6 +249,11 @@ export async function updateUser(db, auth, id, body, maxFailedLogins) {
 
   const data = { ...body };
   delete data.password;
+  delete data.skillIds;
+  const siteId = data.siteId !== undefined ? data.siteId : before.site_id;
+  // moving to another site without picking a shift drops the old site's shift
+  if (data.siteShiftId === undefined && siteId !== before.site_id) data.siteShiftId = null;
+  await checkShift(db, siteId, data.siteShiftId !== undefined ? data.siteShiftId : before.site_shift_id);
   if (data.empCode !== undefined && !data.empCode?.trim()) delete data.empCode; // keep the existing code
   const { cols, vals } = pickColumns(data);
 
@@ -235,6 +273,7 @@ export async function updateUser(db, auth, id, body, maxFailedLogins) {
     if (body.isActive === false) {
       await client.query(`UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, [id]);
     }
+    await saveSkills(client, id, after[0].role_id, body.skillIds);
     await writeAudit(client, {
       entity: 'users',
       entityId: id,

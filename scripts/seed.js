@@ -27,12 +27,10 @@ const MENUS = [
       { name: 'Teams', url: '/administration/teams', order: 3 },
       { name: 'Parameters', url: '/administration/parameters', order: 4 },
       { name: 'Site Master', url: '/administration/sites', order: 5 },
-      { name: 'Shift Master', url: '/administration/shifts', order: 6 },
       { name: 'Resource Grade & Cost', url: '/administration/resource-grades', order: 8 },
-      { name: 'Task Groups', url: '/administration/task-groups', order: 9 },
-      { name: 'Task Types', url: '/administration/task-types', order: 10 },
-      { name: 'Project Divisions', url: '/administration/project-divisions', order: 11 },
-      { name: 'Project Types', url: '/administration/project-types', order: 12 },
+      { name: 'Task Groups & Types', url: '/administration/task-groups', order: 9 }, // tabs: groups, task types and task categories
+      { name: 'Task Master', url: '/administration/task-master', order: 10, actions: ['view', 'edit'] }, // who can see whose tasks / timesheets
+      { name: 'Business Division', url: '/administration/project-divisions', order: 11 },
       { name: 'Project Stages', url: '/administration/project-stages', order: 13 },
     ],
   },
@@ -45,6 +43,13 @@ const MENUS = [
     children: [{ name: 'Project List', url: '/projects', order: 1 }],
   },
   {
+    name: 'Task', icon: 'clipboard-list', order: 25,
+    children: [
+      { name: 'Task', url: '/tasks', order: 2 },
+      { name: '1-3-5', url: '/task-135', order: 3, hidden: true }, // daily planner (1 big, 3 medium, 5 small) – a tab on the Task page, not in the sidebar
+    ],
+  },
+  {
     name: 'Timesheet', icon: 'clock-3', order: 30,
     children: [{ name: 'Timesheet', url: '/timesheet', order: 1 }],
   },
@@ -52,8 +57,9 @@ const MENUS = [
 
 const ALL = { view: true, create: true, edit: true, delete: true, approve: true, export: true };
 const CONFIG_SCREENS = [
-  '/administration/teams', '/administration/parameters', '/administration/sites', '/administration/shifts', '/administration/resource-grades', '/administration/task-groups',
-  '/administration/task-types', '/administration/project-divisions', '/administration/project-types', '/administration/project-stages', '/customers',
+  '/administration/teams', '/administration/parameters', '/administration/sites', '/administration/resource-grades',
+  '/administration/task-groups',
+  '/administration/project-divisions', '/administration/project-stages', '/customers',
 ];
 // role code -> screen url -> actions (Super Admin needs none: level 0 can do everything).
 // Rows that already exist are not changed, so edits made on the Roles screen are kept.
@@ -61,7 +67,10 @@ const PERMISSIONS = {
   ADMIN: {
     '/administration/users': ALL,
     '/administration/roles': ALL,
+    '/administration/task-master': ALL, // only view / edit apply (menu actions)
     '/projects': ALL,
+    '/tasks': ALL,
+    '/task-135': ALL,
     '/timesheet': ALL,
     ...Object.fromEntries(CONFIG_SCREENS.map((u) => [u, ALL])),
   },
@@ -69,36 +78,31 @@ const PERMISSIONS = {
     '/administration/users': { view: true },
     '/projects': { view: true, create: true, edit: true, export: true },
     '/customers': { view: true, create: true, edit: true, export: true },
-    '/administration/project-types': { view: true },
+    '/administration/project-divisions': { view: true },
     '/administration/project-stages': { view: true },
+    '/tasks': { view: true, create: true, edit: true, delete: true, export: true },
+    '/task-135': { view: true, create: true, edit: true, delete: true },
     '/timesheet': { view: true, create: true, edit: true, delete: true, export: true },
   },
   // everyone logs their own time
-  EMPLOYEE: { '/projects': { view: true }, '/timesheet': { view: true, create: true, edit: true, delete: true } },
+  EMPLOYEE: { '/projects': { view: true }, '/tasks': { view: true, create: true, edit: true, delete: true }, '/task-135': { view: true, create: true, edit: true, delete: true }, '/timesheet': { view: true, create: true, edit: true, delete: true } },
   CUSTOMER: { '/projects': { view: true } },
 };
 
 // ---------------------------------------------------------------- Masters
 const USER_TYPES = ['Employee', 'Contractor', 'Customer user', 'Vendor user'];
 const COUNTRIES = [['India', 'IN'], ['United Arab Emirates', 'AE'], ['United Kingdom', 'GB'], ['United States', 'US']];
-// teams [name, country code] and grade levels (lookups GRADE); a resource grade = team + level
+// teams [name, country code] and grade levels (lookups GRADE); one resource grade per level
 const TEAMS = [['Web India', 'IN'], ['SW India', 'IN'], ['SW UAE', 'AE']];
 const GRADES = ['Level A', 'Level B', 'Level C', 'Level D', 'Level E'];
-const TEAM_GRADES = {
-  'Web India': ['Level A', 'Level B', 'Level C', 'Level D', 'Level E'],
-  'SW India': ['Level A', 'Level B', 'Level C', 'Level D', 'Level E'],
-  'SW UAE': ['Level A', 'Level B', 'Level C'],
-};
 // job roles for task templates (AssignedRoles column of the task-template sheet)
 const TASK_ROLES = ['Project Manager', 'Analyst', 'UX/UI Designer', 'Visual Designer', 'Content Writer', 'Developer', 'QA Engineer', 'SEO Specialist'];
 const CURRENCIES = [['Indian Rupee', 'INR'], ['US Dollar', 'USD'], ['UAE Dirham', 'AED'], ['Pound Sterling', 'GBP'], ['Euro', 'EUR']];
-const SITES = ['Emqube DXB', 'Emqube Mumbai'];
-const SHIFTS = [
-  ['Dubai Shift 2020', '08:30', '18:00', 15, 240],
-  ['DXB Shift', '09:00', '18:00', 15, 240],
-  ['Mumbai Shift', '10:00', '19:00', 15, 240],
-  ['Shift 2', '14:00', '18:00', 15, 120],
-];
+// sites and their shifts: [shift title, start, end, late after (mins), half day below (mins)]
+const SITES = {
+  'Emqube DXB': [['General Shift', '09:00', '18:00', 15, 240]],
+  'Emqube Mumbai': [['General Shift', '10:00', '19:00', 15, 240]],
+};
 const TASK_GROUPS = {
   Analysis: ['Requirement Analysis', 'Scope Document'],
   'UX/UI': ['Wireframes', 'UI Design'],
@@ -108,6 +112,16 @@ const TASK_GROUPS = {
   'Post Live Support': ['Post Live Support', 'Bug Fixing'],
   'Content Creation': ['Content Writing', 'Image & Video Content'],
   'Project Management': ['Project Management', 'Client Meetings'],
+};
+// groups of the non-project categories: category -> group -> types (they stay out of project estimates)
+const CATEGORY_TASK_GROUPS = {
+  Personal: {
+    'Personal Work': ['Personal Task', 'Learning & Self-study', 'Planning & Organising'],
+  },
+  Activity: {
+    'Meetings & Training': ['Internal Meeting', 'Training / Workshop', 'Interview'],
+    'Office Activities': ['Administration', 'Team Event', 'Support to Colleagues'],
+  },
 };
 const DIVISIONS = [['Web', 'Websites, portals and digital marketing'], ['Software', 'Custom software and apps']];
 const PROJECT_TYPES = [
@@ -185,7 +199,7 @@ try {
     const parentId = await ensure('menus', { name: mod.name, parent_id: null }, { icon: mod.icon, display_order: mod.order });
     for (const s of mod.children) {
       // actions: only list 'approve' for screens with an approval step; the column default covers the rest
-      menuIds[s.url] = await ensure('menus', { url: s.url }, { name: s.name, parent_id: parentId, display_order: s.order, ...(s.actions ? { actions: s.actions } : {}) });
+      menuIds[s.url] = await ensure('menus', { url: s.url }, { name: s.name, parent_id: parentId, display_order: s.order, ...(s.actions ? { actions: s.actions } : {}), ...(s.hidden ? { is_visible: false } : {}) });
     }
   }
 
@@ -215,18 +229,25 @@ try {
     ));
   }
   for (const [i, name] of TASK_ROLES.entries()) {
-    await q(`INSERT INTO lookups (type, name, display_order) VALUES ('TASK_ROLE', $1, $2) ON CONFLICT (type, name) DO NOTHING`, [name, i + 1]);
+    await q(`INSERT INTO lookups (type, name, display_order) VALUES ('SKILL', $1, $2) ON CONFLICT (type, name) DO NOTHING`, [name, i + 1]);
   }
   for (const [type, list] of [['COUNTRY', COUNTRIES], ['CURRENCY', CURRENCIES]]) {
     for (const [i, [name, value]] of list.entries()) {
       await q(`INSERT INTO lookups (type, name, value, display_order) VALUES ($1, $2, $3, $4) ON CONFLICT (type, name) DO NOTHING`, [type, name, value, i + 1]);
     }
   }
+  // USD rates are entered on Parameters → USD Rates (currency_usd_rates); USD itself is always 1
   const siteIds = {};
-  for (const name of SITES) siteIds[name] = await ensure('sites', { name }, {});
   const shiftIds = {};
-  for (const [name, start, end, late, half] of SHIFTS) {
-    shiftIds[name] = await ensure('shifts', { name }, { start_time: start, end_time: end, late_after_minutes: late, half_day_minutes: half });
+  for (const [name, shifts] of Object.entries(SITES)) {
+    siteIds[name] = await ensure('sites', { name }, {});
+    for (const [i, [shift, start, end, late, half]] of shifts.entries()) {
+      shiftIds[`${name}/${shift}`] = await ensure(
+        'site_shifts',
+        { site_id: siteIds[name], name: shift },
+        { start_time: start, end_time: end, late_after_minutes: late, half_day_minutes: half, display_order: i + 1 },
+      );
+    }
   }
 
   const groupIds = {};
@@ -236,9 +257,21 @@ try {
     for (const t of types) typeIds[`${group}/${t}`] = await ensure('task_types', { task_group_id: groupIds[group], name: t }, {});
   }
 
+  for (const [category, groups] of Object.entries(CATEGORY_TASK_GROUPS)) {
+    for (const [group, types] of Object.entries(groups)) {
+      groupIds[group] = await ensure('task_groups', { name: group }, {});
+      for (const t of types) await ensure('task_types', { task_group_id: groupIds[group], name: t }, {});
+      await q(`INSERT INTO task_category_groups (task_category_id, task_group_id) SELECT c.id, $2 FROM task_categories c WHERE lower(c.name) = lower($1) ON CONFLICT DO NOTHING`, [category, groupIds[group]]);
+    }
+  }
+  // the first seeded groups are project work: link them to the project categories
+  await q(`INSERT INTO task_category_groups (task_category_id, task_group_id) SELECT c.id, g.id FROM task_categories c CROSS JOIN task_groups g WHERE c.is_project AND g.name = ANY($1) ON CONFLICT DO NOTHING`, [Object.keys(TASK_GROUPS)]);
+
   for (const [name, description] of DIVISIONS) await ensure('project_divisions', { name }, { description });
   const projectTypeIds = {};
-  for (const name of PROJECT_TYPES) projectTypeIds[name] = await ensure('project_types', { name }, {});
+  // the seeded project types are web / marketing work → division "Web"
+  const webDivision = await one(`SELECT id FROM project_divisions WHERE name = 'Web'`);
+  for (const name of PROJECT_TYPES) projectTypeIds[name] = await ensure('project_types', { name }, { project_division_id: webDivision.id });
 
   for (const [type, groups] of Object.entries(DEFAULT_ESTIMATES)) {
     for (const [group, pct] of Object.entries(groups)) {
@@ -261,17 +294,18 @@ try {
 
   for (const [name, country] of TEAMS) {
     const c = await one(`SELECT id FROM lookups WHERE type = 'COUNTRY' AND value = $1`, [country]);
-    const teamId = await ensure('teams', { name }, { country_id: c?.id ?? null });
-    for (const level of TEAM_GRADES[name]) await ensure('resource_grades', { grade_id: gradeIds[level], team_id: teamId }, {});
+    await ensure('teams', { name }, { country_id: c?.id ?? null });
   }
+  // one resource grade per grade level (cost history is added on the Resource Grade & Cost screen)
+  for (const level of GRADES) await ensure('resource_grades', { grade_id: gradeIds[level] }, {});
 
   const existingAdmin = await one(`SELECT id FROM users WHERE username = $1`, [ADMIN_USERNAME]);
   if (!existingAdmin) {
     const hash = await bcrypt.hash(ADMIN_PASSWORD, 12);
     await q(
-      `INSERT INTO users (emp_code, username, password_hash, name, email, role_id, site_id, shift_id)
+      `INSERT INTO users (emp_code, username, password_hash, name, email, role_id, site_id, site_shift_id)
        VALUES ('EMP-1001', $1, $2, 'System Administrator', 'admin@emqube.com', $3, $4, $5)`,
-      [ADMIN_USERNAME, hash, roleIds.SUPER_ADMIN, siteIds['Emqube Mumbai'], shiftIds['Mumbai Shift']],
+      [ADMIN_USERNAME, hash, roleIds.SUPER_ADMIN, siteIds['Emqube Mumbai'], shiftIds['Emqube Mumbai/General Shift']],
     );
     console.log(`Super Admin created → username: ${ADMIN_USERNAME}  password: ${ADMIN_PASSWORD}  (change it after first login)`);
   } else {

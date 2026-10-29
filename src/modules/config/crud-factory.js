@@ -13,8 +13,9 @@ import { escapeLike, idList, paginationQuerySchema, pagedResponseSchema, WhereBu
  *   computed: { apiName: schema },              // extra read-only output fields (snake_case in SQL)
  *   search: ['name', …],                         // output columns of `select` to search
  *   filters: { queryParam: { schema, sql: (where, value) => void } },
+ *   links: { apiName: { table, owner, other, schema } }, // many-to-many id lists kept in a link table, saved with the record
  *   sort: { apiName: 'sql expr' }, defaultSort,
- *   uniqueMessage, beforeSave(db, body, id)
+ *   uniqueMessage, beforeSave(db, body, id), beforeDelete(db, id) – e.g. refuse while the record is in use
  * }
  */
 export function crudRoutes(def) {
@@ -29,7 +30,10 @@ export function crudRoutes(def) {
   };
   const itemSchema = { type: 'object', properties: outputProps };
   const idParams = { type: 'object', required: ['id'], properties: { id: { type: 'integer', minimum: 1 } } };
-  const bodyProps = Object.fromEntries(Object.entries(def.fields).map(([k, f]) => [k, f.schema]));
+  const bodyProps = {
+    ...Object.fromEntries(Object.entries(def.fields).map(([k, f]) => [k, f.schema])),
+    ...Object.fromEntries(Object.entries(def.links ?? {}).map(([k, l]) => [k, l.schema])),
+  };
   const tags = [def.label];
 
   const toDto = (row) => {
@@ -107,6 +111,16 @@ export function crudRoutes(def) {
       }
       return { cols, vals };
     };
+    // replaces the linked ids of a record (a link not in the body is left as it is)
+    const saveLinks = async (client, id, body) => {
+      for (const [k, l] of Object.entries(def.links ?? {})) {
+        if (body[k] === undefined) continue;
+        await client.query(`DELETE FROM ${l.table} WHERE ${l.owner} = $1`, [id]);
+        if (body[k].length) {
+          await client.query(`INSERT INTO ${l.table} (${l.owner}, ${l.other}) SELECT $1, unnest($2::bigint[]) ON CONFLICT DO NOTHING`, [id, [...new Set(body[k])]]);
+        }
+      }
+    };
     const wrapUnique = async (fn) => {
       try {
         return await fn();
@@ -144,6 +158,7 @@ export function crudRoutes(def) {
               `INSERT INTO ${def.table} (${cols.join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING id`,
               vals,
             );
+            await saveLinks(client, rows[0].id, req.body);
             await writeAudit(client, { entity: def.table, entityId: rows[0].id, action: 'create', userId: req.auth.userId });
             return rows[0].id;
           }),
@@ -181,6 +196,7 @@ export function crudRoutes(def) {
               `UPDATE ${def.table} SET ${cols.map((c, i) => `${c} = $${i + 2}`).join(', ')} WHERE id = $1 RETURNING *`,
               [id, ...vals],
             );
+            await saveLinks(client, id, req.body);
             await writeAudit(client, {
               entity: def.table,
               entityId: id,
@@ -199,6 +215,7 @@ export function crudRoutes(def) {
       { schema: { tags, summary: 'Delete', params: idParams, response: { 204: { type: 'null' } } }, preHandler: authorize(def.screen, 'delete') },
       async (req, reply) => {
         const id = req.params.id;
+        if (def.beforeDelete) await def.beforeDelete(db, id);
         try {
           const { rowCount } = await db.tx(async (client) => {
             const res = await client.query(`DELETE FROM ${def.table} WHERE id = $1 AND id IN (SELECT id FROM (${def.select}) s)`, [id]);

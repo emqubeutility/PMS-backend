@@ -1,8 +1,50 @@
 import { writeAudit, diff } from '../../utils/audit.js';
-import { badRequest, conflict, isReferenceError, notFound } from '../../utils/errors.js';
+import { badRequest, conflict, forbidden, isReferenceError, notFound } from '../../utils/errors.js';
 import { escapeLike, idList, WhereBuilder } from '../../utils/query.js';
+import { sqlToday } from '../../utils/time.js';
 import { exact } from '../../utils/number.js';
-import { insertReview, listReviews, loadMemberHours, loadMembers, saveEstimates, saveMembers } from './projects.tabs.js';
+import { fieldAccess, maskFields, PROJECT_FIELDS, tabAccess } from './project-access.js';
+
+/** Refuses when the user's role may not use / change a project tab (Roles & Permissions → Project access). */
+function needTab(auth, tab, level, what) {
+  const a = tabAccess(auth, tab);
+  if (a === 'hidden' || (level === 'edit' && a !== 'edit')) throw forbidden(`Your role cannot ${level === 'edit' ? 'change' : 'see'} ${what}`);
+}
+
+const norm = (v) => (v === null || v === undefined || v === '' ? null : typeof v === 'string' ? v.trim() : v);
+const changed = (oldValue, newValue) => {
+  const a = norm(oldValue);
+  const b = norm(newValue);
+  if (a === null || b === null) return a !== b;
+  if (typeof b === 'number' || typeof b === 'boolean') return String(Number(a)) !== String(Number(b)) && String(a) !== String(b);
+  return String(a) !== String(b);
+};
+
+/** Edits of a saved project: each changed part needs its tab / field rule at 'edit'. */
+function assertProjectEdits(auth, before, body, members, estimates) {
+  if (members !== undefined) needTab(auth, 'users', 'edit', 'the project members');
+  if (estimates !== undefined || (body.estimatedHours !== undefined && changed(before.estimated_hours, body.estimatedHours))) {
+    needTab(auth, 'estimate', 'edit', 'the estimate');
+  }
+  if (body.stageId !== undefined && changed(before.stage_id, body.stageId)) needTab(auth, 'update', 'edit', 'the stage');
+  for (const f of PROJECT_FIELDS) {
+    if (body[f.key] === undefined || !changed(before[f.col], body[f.key])) continue;
+    if (tabAccess(auth, 'project') !== 'edit' || fieldAccess(auth, f.key) !== 'edit') throw forbidden(`Your role cannot change the ${f.label.toLowerCase()}`);
+  }
+}
+
+/** New project: optional fields the role may not edit get their default (required ones are always set). */
+const NEW_DEFAULTS = { estimatedAmountCurrency: 'AED', isRetainerProject: false, isBillable: true };
+function applyCreateRules(auth, body) {
+  const out = { ...body };
+  for (const f of PROJECT_FIELDS) {
+    if (f.required || fieldAccess(auth, f.key) === 'edit') continue;
+    out[f.key] = NEW_DEFAULTS[f.key] ?? null;
+  }
+  return out;
+}
+import { workLabel } from '../projectplan/plan-guard.js';
+import { insertReview, insertSystemLog, listReviews, memberUsage, loadMemberHours, loadMembers, saveEstimates, saveMembers } from './projects.tabs.js';
 
 export const PROJECT_STATUSES = ['not_started', 'in_progress', 'on_hold', 'completed', 'cancelled'];
 const ACTIVE_STATUSES = ['not_started', 'in_progress'];
@@ -23,6 +65,7 @@ const FIELDS = {
   estimatedAmountCurrency: 'estimated_amount_currency',
   sharepointLink: 'sharepoint_link',
   isRetainerProject: 'is_retainer_project',
+  isBillable: 'is_billable',
   detail: 'detail',
   stageId: 'stage_id',
 };
@@ -33,6 +76,8 @@ const AUDIT_KEYS = [...Object.values(FIELDS).filter((c) => c !== 'stage_id'), 's
 const SELECT = `
   SELECT p.*, c.name AS customer_name, d.name AS division_name, t.name AS type_name,
          o.name AS owner_name, o.email AS owner_email, st.name AS stage_name,
+         (SELECT q.rate_per_hour FROM project_division_quote_rates q
+           WHERE q.project_division_id = p.project_division_id AND q.currency = p.estimated_amount_currency) AS quote_rate,
          COALESCE(prog.progress, 0) AS progress,
          COALESCE(ts.logged_minutes, 0) AS logged_minutes,
          lc.comment AS last_comment, lc.created_at AS last_comment_at, lc.author AS last_comment_by,
@@ -80,11 +125,13 @@ const toDto = (p) => ({
   projectTypeId: p.project_type_id,
   typeName: p.type_name,
   isRetainerProject: p.is_retainer_project,
+  isBillable: p.is_billable,
   startDate: p.start_date,
   endDate: p.end_date,
   estimatedHours: p.estimated_hours,
   estimatedAmount: p.estimated_amount,
   estimatedAmountCurrency: p.estimated_amount_currency?.trim() ?? null,
+  quoteRatePerHour: p.quote_rate ?? null, // the division's quote rate in the project's currency
   sharepointLink: p.sharepoint_link,
   detail: p.detail,
   status: p.status, // category of the stage
@@ -164,7 +211,7 @@ function buildFilters(auth, q) {
   const stageIds = idList(q.stageId);
   if (stageIds.length) where.add(`p.stage_id = ANY($?)`, stageIds);
   if (q.isRetainerProject !== undefined) where.add(`p.is_retainer_project = $?`, q.isRetainerProject);
-  if (q.overdue) where.add(`p.end_date < current_date AND p.status = ANY($?)`, ACTIVE_STATUSES);
+  if (q.overdue) where.add(`p.end_date < ${sqlToday(auth)} AND p.status = ANY($?)`, ACTIVE_STATUSES);
   if (q.startFrom) where.add(`p.start_date >= $?`, q.startFrom);
   if (q.startTo) where.add(`p.start_date <= $?`, q.startTo);
   if (q.endFrom) where.add(`p.end_date >= $?`, q.endFrom);
@@ -190,7 +237,7 @@ export async function listProjects(db, auth, q) {
     `SELECT count(*)::int AS total FROM projects p LEFT JOIN customers c ON c.id = p.customer_id ${countWhere.toSql()}`,
     countWhere.params,
   );
-  return { items: rows.map(toDto), total: cnt[0].total, page: q.page, pageSize: q.pageSize };
+  return { items: rows.map((r) => maskFields(auth, toDto(r))), total: cnt[0].total, page: q.page, pageSize: q.pageSize };
 }
 
 /**
@@ -201,6 +248,7 @@ export async function listProjects(db, auth, q) {
  *   Hours this month – logged hours, billable / internal, hours per day of the current week
  */
 export async function projectSummary(db, auth) {
+  const today = sqlToday(auth); // the user's today (their time zone)
   const where = new WhereBuilder();
   applyDataScope(where, auth);
   const scope = { sql: where.toSql(), params: [...where.params] }; // for queries that don't use "me"
@@ -219,8 +267,8 @@ export async function projectSummary(db, auth) {
               count(*) FILTER (WHERE p.status = 'on_hold' AND p.customer_id IS NOT NULL)::int AS on_hold_client,
               count(*) FILTER (WHERE p.status = 'completed')::int AS completed,
               count(*) FILTER (WHERE p.status = 'cancelled')::int AS cancelled,
-              count(*) FILTER (WHERE ${active} AND p.end_date < current_date)::int AS late,
-              count(*) FILTER (WHERE ${active} AND p.end_date BETWEEN current_date AND current_date + 14)::int AS at_risk,
+              count(*) FILTER (WHERE ${active} AND p.end_date < ${today})::int AS late,
+              count(*) FILTER (WHERE ${active} AND p.end_date BETWEEN ${today} AND ${today} + 14)::int AS at_risk,
               count(*) FILTER (WHERE ${active} AND p.created_at >= date_trunc('month', now()))::int AS created_this_month,
               count(*) FILTER (WHERE p.owner_id = ${me}
                                 OR EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = p.id AND pm.user_id = ${me}))::int AS mine,
@@ -253,14 +301,14 @@ export async function projectSummary(db, auth) {
        SELECT COALESCE(SUM(t.minutes), 0)::int AS total,
               COALESCE(SUM(t.minutes) FILTER (WHERE t.is_billable), 0)::int AS billable
          FROM timesheets t JOIN scoped p ON p.id = t.project_id
-        WHERE t.work_date >= date_trunc('month', current_date)`,
+        WHERE t.work_date >= date_trunc('month', ${today})`,
       scope.params,
     ),
     // hours per day of the current week, Monday first
     db.query(
       `WITH ${scoped}
        SELECT d.day::date AS day, COALESCE(SUM(t.minutes), 0)::int AS minutes
-         FROM generate_series(date_trunc('week', current_date), date_trunc('week', current_date) + interval '6 days', interval '1 day') AS d(day)
+         FROM generate_series(date_trunc('week', ${today}), date_trunc('week', ${today}) + interval '6 days', interval '1 day') AS d(day)
          LEFT JOIN timesheets t ON t.work_date = d.day::date AND t.project_id IN (SELECT id FROM scoped)
         GROUP BY d.day ORDER BY d.day`,
       scope.params,
@@ -309,6 +357,98 @@ export async function projectSummary(db, auth) {
   };
 }
 
+/**
+ * Commercial tab (project value, outsource / purchase / other values, members' rates and value):
+ * whoever's role has the tab (Roles & Permissions → Project access); Super Admin always.
+ */
+export const canSeeCommercial = (auth) => tabAccess(auth, 'commercial') !== 'hidden';
+
+/** USD rate of each currency (Parameters → CURRENCY): { INR: 0.0119, USD: 1, … }. */
+async function usdRates(db) {
+  const { rows } = await db.query(`SELECT code, usd_rate FROM v_currency_usd_rates WHERE usd_rate IS NOT NULL`); // Parameters → USD Rates
+  return { USD: 1, ...Object.fromEntries(rows.map((r) => [r.code, Number(r.usd_rate)])) };
+}
+
+/**
+ * Commercial figures – always in the project's currency. Project value = the project's total amount.
+ * Member value = logged hours × rate, where the rate is the member's project rate, else the cost of the user's grade
+ * (Resource Grade & Cost) in the project's currency; a grade with no cost in that currency is taken in USD
+ * (or its own currency, through USD) and converted to the project's currency with the USD rates
+ * (Parameters → USD Rates). Outsource / purchase / other values are kept in the project's currency.
+ * Net value = project value − total cost.
+ */
+function commercialOf(row, members, rates) {
+  const projectCurrency = (row.estimated_amount_currency?.trim() || 'INR').toUpperCase();
+  const pRate = rates[projectCurrency] ?? null; // 1 unit of the project currency in USD
+  const missing = new Set();
+  // an amount in another currency → the project currency, through USD
+  const toProject = (v, cur) => {
+    if (v == null) return null;
+    const code = (cur || projectCurrency).trim().toUpperCase();
+    if (code === projectCurrency) return exact(Number(v));
+    if (rates[code] == null) {
+      missing.add(code);
+      return null;
+    }
+    if (!pRate) {
+      missing.add(projectCurrency);
+      return null;
+    }
+    return exact((Number(v) * rates[code]) / pRate);
+  };
+  const fromUsd = (usd) => {
+    if (usd == null) return null;
+    if (!pRate) {
+      missing.add(projectCurrency);
+      return null;
+    }
+    return exact(usd / pRate);
+  };
+  const list = members.map((m) => {
+    const projectRate = toProject(m.costPerHour, m.currency);
+    // users have no own rate: their cost comes from their grade – in the project currency, else through USD
+    const gradeDirect = m.gradeRate;
+    const gradeViaUsd = gradeDirect == null ? fromUsd(m.gradeRateUsd) : null;
+    const gradeRate = gradeDirect ?? gradeViaUsd;
+    const rate = projectRate ?? gradeRate;
+    const rateSource = projectRate != null ? 'project' : gradeDirect != null ? 'grade' : gradeViaUsd != null ? 'grade_usd' : null;
+    return {
+      id: m.id,
+      name: m.name,
+      isOwner: m.isOwner,
+      gradeName: m.gradeName,
+      teamName: m.teamName,
+      costPerHour: projectRate,
+      gradeRate,
+      gradeRateViaUsd: gradeViaUsd != null,
+      defaultRate: null,
+      rateSource,
+      rate,
+      loggedHours: m.loggedHours,
+      value: rate != null ? exact(m.loggedHours * rate) : null,
+    };
+  });
+  const totalValue = row.estimated_amount != null ? Number(row.estimated_amount) : null;
+  const membersValue = exact(list.reduce((s, m) => s + (m.value ?? 0), 0));
+  const other = [row.outsource_value, row.purchase_value, row.other_value].reduce((s, v) => s + Number(v ?? 0), 0);
+  const totalCost = exact(membersValue + other);
+  return {
+    currency: projectCurrency,
+    projectCurrency,
+    projectAmount: row.estimated_amount,
+    usdRate: pRate,
+    missingRates: [...missing],
+    totalValue,
+    outsourceValue: row.outsource_value,
+    purchaseValue: row.purchase_value,
+    otherValue: row.other_value,
+    membersValue,
+    totalCost,
+    netValue: totalValue != null ? exact(totalValue - totalCost) : null,
+    members: list,
+  };
+}
+
 export async function getProject(db, auth, id) {
   const where = new WhereBuilder();
   where.add(`p.id = $?`, id);
@@ -321,7 +461,14 @@ export async function getProject(db, auth, id) {
     db.query(
       `SELECT e.task_group_id, g.name, e.effort_percentage,
               COALESCE((SELECT SUM(t.minutes) FROM timesheets t JOIN task_types tt ON tt.id = t.task_type_id
-                         WHERE t.project_id = e.project_id AND tt.task_group_id = e.task_group_id), 0) AS actual_minutes
+                         WHERE t.project_id = e.project_id AND tt.task_group_id = e.task_group_id), 0) AS actual_minutes,
+              (SELECT count(*)::int FROM timesheets t JOIN task_types tt ON tt.id = t.task_type_id
+                WHERE t.project_id = e.project_id AND tt.task_group_id = e.task_group_id) AS entries,
+              (SELECT count(*)::int FROM tasks k WHERE k.project_id = e.project_id AND k.task_group_id = e.task_group_id AND k.is_active
+                  AND k.status IN ('in_progress', 'completed')) AS started,
+              -- the % complete of the group in the latest Update-tab review that reported it
+              (SELECT g2.completion_percentage FROM project_review_task_groups g2 JOIN project_reviews r2 ON r2.id = g2.project_review_id
+                WHERE r2.project_id = e.project_id AND g2.task_group_id = e.task_group_id ORDER BY r2.review_date DESC, r2.id DESC LIMIT 1) AS reported
          FROM project_task_group_estimates e JOIN task_groups g ON g.id = e.task_group_id
         WHERE e.project_id = $1 ORDER BY e.effort_percentage DESC, g.name`,
       [id],
@@ -336,25 +483,36 @@ export async function getProject(db, auth, id) {
     loadMemberHours(db, id),
   ]);
   const est = rows[0].estimated_hours;
-  return {
+  // rates, grades and costs are commercial – hidden from everyone else (and from roles without the tab)
+  const commercial = canSeeCommercial(auth);
+  const hiddenTab = (t) => tabAccess(auth, t) === 'hidden';
+  const hide = { costPerHour: null, currency: null, defaultRate: null, defaultRateCurrency: null, gradeName: null, gradeRate: null, gradeRateUsd: null };
+  return maskFields(auth, {
     ...toDto(rows[0]),
     taskCount: taskCount.rows[0].n,
     createdByName: record.rows[0].created_by_name,
     updatedByName: record.rows[0].updated_by_name,
-    members,
-    memberHours,
+    canSeeCommercial: commercial,
+    commercial: commercial ? commercialOf(rows[0], members, await usdRates(db)) : null,
+    members: hiddenTab('users') ? [] : commercial ? members : members.map((m) => ({ ...m, ...hide })),
+    memberHours: hiddenTab('analysis') ? [] : commercial ? memberHours : memberHours.map((m) => ({ ...m, rate: null, cost: null })),
     estimates: estimates.rows.map((e) => ({
       taskGroupId: e.task_group_id,
       taskGroupName: e.name,
       effortPercentage: e.effort_percentage,
       hours: est != null ? exact((est * e.effort_percentage) / 100) : null,
       actualHours: exact(Number(e.actual_minutes) / 60),
+      // work has started in the group: its effort cannot be set to 0%
+      reportedPercentage: e.reported == null ? 0 : Number(e.reported),
+      locked: e.entries > 0 || e.started > 0,
+      lockReason: e.entries > 0 || e.started > 0 ? workLabel(e) : null,
     })),
-  };
+  });
 }
 
 /** Audit-log entries of a project, newest first. */
 export async function projectActivity(db, auth, id) {
+  needTab(auth, 'history', 'view', 'the project history');
   await getProject(db, auth, id); // existence + data scope
   const { rows } = await db.query(
     `SELECT a.id, a.action, a.message, a.changes, a.logged_at, u.name AS user_name
@@ -399,6 +557,12 @@ async function validateReferences(db, body) {
     if (!rows[0]) throw badRequest(`${label} does not exist`, [{ field, message: 'does not exist' }]);
     if (!rows[0].is_active) throw badRequest(`${label} is inactive`, [{ field, message: 'is inactive' }]);
   }
+  if (body.projectTypeId !== undefined && body.projectDivisionId !== undefined) {
+    const { rows } = await db.query(`SELECT project_division_id FROM project_types WHERE id = $1`, [body.projectTypeId]);
+    if (rows[0]?.project_division_id && rows[0].project_division_id !== body.projectDivisionId) {
+      throw badRequest('This project type belongs to another division', [{ field: 'projectTypeId', message: 'not in the selected division' }]);
+    }
+  }
   if (body.startDate && body.endDate && body.endDate < body.startDate) {
     throw badRequest('End date cannot be before the start date', [{ field: 'endDate', message: 'must be on or after the start date' }]);
   }
@@ -431,8 +595,26 @@ function pickColumns(body) {
  *   - creates the template tasks
  * The owner is added as a project member with edit access.
  */
-export async function createProject(db, auth, body) {
-  await validateReferences(db, body);
+/**
+ * Default estimated hours from the quote: total amount / the division's quote rate per hour in the
+ * project's currency. Only fills the hours while they are empty – hours entered by hand are kept.
+ */
+async function applyQuotedHours(db, body, before = {}) {
+  const hours = body.estimatedHours !== undefined ? body.estimatedHours : before.estimated_hours;
+  if (hours != null) return body;
+  const amount = body.estimatedAmount !== undefined ? body.estimatedAmount : before.estimated_amount;
+  const currency = (body.estimatedAmountCurrency !== undefined ? body.estimatedAmountCurrency : before.estimated_amount_currency)?.trim();
+  const divisionId = body.projectDivisionId ?? before.project_division_id;
+  if (amount == null || !currency || !divisionId) return body;
+  const { rows } = await db.query(`SELECT rate_per_hour FROM project_division_quote_rates WHERE project_division_id = $1 AND currency = $2`, [divisionId, currency]);
+  if (!rows[0]) return body;
+  return { ...body, estimatedHours: exact(amount / rows[0].rate_per_hour) };
+}
+
+export async function createProject(db, auth, input) {
+  input = applyCreateRules(auth, input);
+  await validateReferences(db, input);
+  const body = await applyQuotedHours(db, input);
   const id = await db.tx(async (client) => {
     const code = await nextProjectCode(client);
     const stage = await resolveStage(client, body.stageId);
@@ -454,12 +636,24 @@ export async function createProject(db, auth, body) {
     const tasks = await client.query(
       // task estimate = project estimated hours × the task's effort % (when both are known)
       `INSERT INTO tasks (kind, customer_id, project_id, task_group_id, task_type_id, name, description, owner_id, status,
-                          estimated_minutes, display_order, created_by, updated_by)
-       SELECT 'project', $2, $1, task_group_id, task_type_id, task_title, description, $3, 'open',
-              ROUND($6::numeric * 60 * effort_percentage / 100)::int, sort_order, $5, $5
+                          estimated_minutes, display_order, created_by, updated_by, task_category_id)
+       SELECT 'project', $2, $1, task_group_id, task_type_id, task_title, description, $3, 'to_do',
+              ROUND($6::numeric * 60 * effort_percentage / 100)::int, sort_order, $5, $5,
+              (SELECT c.id FROM task_categories c WHERE c.is_project ORDER BY c.is_active DESC, c.display_order, c.id LIMIT 1)
          FROM project_type_task_templates WHERE project_type_id = $4
         ORDER BY sort_order`,
       [projectId, body.customerId ?? null, body.ownerId, body.projectTypeId, auth.userId, body.estimatedHours ?? null],
+    );
+    // each task keeps the task roles (skills) of its template task
+    await client.query(
+      `INSERT INTO task_skills (task_id, skill_id)
+       SELECT DISTINCT t.id, r.role_id
+         FROM tasks t
+         JOIN project_type_task_templates tt ON tt.project_type_id = $2 AND tt.task_title = t.name
+         JOIN project_type_task_template_roles r ON r.task_template_id = tt.id
+        WHERE t.project_id = $1
+       ON CONFLICT DO NOTHING`,
+      [projectId, body.projectTypeId],
     );
     await client.query(
       `INSERT INTO project_members (project_id, user_id, access_level, created_by, updated_by) VALUES ($1, $2, 'edit', $3, $3)`,
@@ -479,17 +673,22 @@ export async function createProject(db, auth, body) {
 
 export async function updateProject(db, auth, id, input) {
   // members / estimates (Users and Estimate tabs) are saved in the same transaction as the fields
-  const { members, estimates, ...body } = input;
+  const { members, estimates, confirmRemove, ...body } = input;
   await getProject(db, auth, id); // existence + data scope
   const { rows } = await db.query(`SELECT * FROM projects WHERE id = $1`, [id]);
   const before = rows[0];
+  assertProjectEdits(auth, before, body, members, estimates);
   await validateReferences(db, {
     ...body,
+    // check the type against the division even when only one of them changes
+    ...(body.projectTypeId !== undefined || body.projectDivisionId !== undefined
+      ? { projectTypeId: body.projectTypeId ?? before.project_type_id, projectDivisionId: body.projectDivisionId ?? before.project_division_id }
+      : {}),
     startDate: body.startDate ?? before.start_date,
     endDate: body.endDate === undefined ? before.end_date : body.endDate,
   });
 
-  const { cols, vals } = pickColumns(body);
+  const { cols, vals } = pickColumns(await applyQuotedHours(db, body, before));
   if (body.stageId !== undefined) {
     const stage = await resolveStage(db, body.stageId);
     cols.push('stage', 'status');
@@ -516,7 +715,7 @@ export async function updateProject(db, auth, id, input) {
       if (c) changes.members = c;
     }
     if (estimates) {
-      const c = await saveEstimates(client, auth, id, estimates);
+      const c = await saveEstimates(client, auth, id, estimates, confirmRemove === true);
       if (c) changes.estimate = c;
     }
     await writeAudit(client, {
@@ -530,7 +729,133 @@ export async function updateProject(db, auth, id, input) {
   return getProject(db, auth, id);
 }
 
+/** Commercial tab: outsource / purchase / other values and the members' cost per hour. */
+export async function updateCommercial(db, auth, id, body) {
+  needTab(auth, 'commercial', 'edit', 'the commercial values');
+  const project = await getProject(db, auth, id); // existence + data scope
+  if (!project.canSeeCommercial) throw forbidden('Your role cannot change the commercial values');
+  const { rows } = await db.query(`SELECT * FROM projects WHERE id = $1`, [id]);
+  const before = rows[0];
+  // the Commercial tab works in the project's currency: values and member rates are saved in it
+  const cur = project.commercial.projectCurrency;
+  const usd = new Map(project.commercial.members.map((m) => [m.id, m.costPerHour]));
+  const memberIds = new Set(project.members.map((m) => m.id));
+  const unknown = (body.members ?? []).find((m) => !memberIds.has(m.userId));
+  if (unknown) throw badRequest('A rate is given for someone who is not a member of the project', [{ field: 'members', message: 'not a member' }]);
+
+  await db.tx(async (client) => {
+    const { rows: after } = await client.query(
+      `UPDATE projects SET outsource_value = $2, purchase_value = $3, other_value = $4, updated_by = $5 WHERE id = $1 RETURNING *`,
+      [id, body.outsourceValue ?? null, body.purchaseValue ?? null, body.otherValue ?? null, auth.userId],
+    );
+    const changes = diff(before, after[0], ['outsource_value', 'purchase_value', 'other_value']) ?? {};
+    for (const m of body.members ?? []) {
+      const old = project.members.find((x) => x.id === m.userId);
+      if ((usd.get(m.userId) ?? null) === (m.costPerHour ?? null)) continue;
+      await client.query(`UPDATE project_members SET cost_per_hour = $3, currency = $4, updated_by = $5 WHERE project_id = $1 AND user_id = $2`, [
+        id,
+        m.userId,
+        m.costPerHour ?? null,
+        m.costPerHour != null ? cur : null,
+        auth.userId,
+      ]);
+      changes[`rate (${cur}): ${old.name}`] = { old: usd.get(m.userId) ?? null, new: m.costPerHour ?? null };
+    }
+    await writeAudit(client, {
+      entity: 'projects',
+      entityId: id,
+      action: 'update',
+      userId: auth.userId,
+      message: 'Commercial values saved',
+      changes: Object.keys(changes).length ? changes : null,
+    });
+  });
+  return getProject(db, auth, id);
+}
+
+/**
+ * Tasks tab: the project's tasks with the skills they need and the project members who have one of
+ * those skills (Users → Skills).
+ */
+export async function projectTasks(db, auth, id) {
+  needTab(auth, 'tasks', 'view', 'the project tasks');
+  await getProject(db, auth, id); // existence + data scope
+  const [tasks, members] = await Promise.all([
+    db.query(
+      `SELECT t.id, t.name, t.description, t.status, t.priority, g.name AS group_name, tt.name AS type_name,
+              t.owner_id, o.name AS owner_name, t.assigned_to, a.name AS assigned_to_name,
+              t.planned_start, t.planned_end, t.is_continuous, t.completed_on,
+              (t.status <> 'completed' AND NOT t.is_continuous AND t.planned_end < now()) AS is_overdue,
+              (SELECT count(*)::int FROM task_subtasks s WHERE s.task_id = t.id) AS subtask_count,
+              (SELECT count(*)::int FROM task_subtasks s WHERE s.task_id = t.id AND s.is_done) AS subtask_done,
+              COALESCE((SELECT json_agg(json_build_object('id', l.id, 'name', l.name) ORDER BY l.display_order, l.name)
+                          FROM task_skills ts JOIN lookups l ON l.id = ts.skill_id WHERE ts.task_id = t.id), '[]') AS skills
+         FROM tasks t
+         LEFT JOIN task_groups g ON g.id = t.task_group_id
+         LEFT JOIN task_types tt ON tt.id = t.task_type_id
+         LEFT JOIN users o ON o.id = t.owner_id
+         LEFT JOIN users a ON a.id = t.assigned_to
+        WHERE t.project_id = $1 AND t.is_active
+        -- open work first, then by priority (urgent → low), then the soonest end date (continuous after dated)
+        ORDER BY (t.status = 'completed'),
+                 COALESCE(array_position(ARRAY['urgent','high','medium','low']::varchar[], t.priority), 5),
+                 t.planned_end NULLS LAST, t.display_order, t.id`,
+      [id],
+    ),
+    db.query(
+      `SELECT u.id, u.name, r.name AS role_name, COALESCE(array_agg(us.skill_id) FILTER (WHERE us.skill_id IS NOT NULL), '{}') AS skill_ids
+         FROM project_members pm
+         JOIN users u ON u.id = pm.user_id
+         JOIN roles r ON r.id = u.role_id
+         LEFT JOIN user_skills us ON us.user_id = u.id
+        WHERE pm.project_id = $1
+        GROUP BY u.id, u.name, r.name
+        ORDER BY u.name`,
+      [id],
+    ),
+  ]);
+  return tasks.rows.map((t) => {
+    const need = new Set(t.skills.map((x) => x.id));
+    const matches = members.rows
+      .map((m) => ({ id: m.id, name: m.name, roleName: m.role_name, skills: t.skills.filter((x) => m.skill_ids.map(Number).includes(x.id)).map((x) => x.name) }))
+      .filter((m) => need.size && m.skills.length);
+    return {
+      id: t.id,
+      name: t.name,
+      description: t.description,
+      status: t.status,
+      priority: t.priority,
+      taskGroupName: t.group_name,
+      taskTypeName: t.type_name,
+      ownerId: t.owner_id,
+      ownerName: t.owner_name,
+      assignedTo: t.assigned_to,
+      assignedToName: t.assigned_to_name,
+      plannedStart: t.planned_start,
+      plannedEnd: t.planned_end,
+      isContinuous: t.is_continuous,
+      completedOn: t.completed_on,
+      isOverdue: t.is_overdue,
+      subtaskCount: t.subtask_count,
+      subtaskDone: t.subtask_done,
+      skills: t.skills,
+      matches,
+    };
+  });
+}
+
+/** Users tab: can this member be removed? (asked when the remove button is clicked) */
+export async function memberRemovable(db, auth, id, userId) {
+  needTab(auth, 'users', 'edit', 'the project members');
+  const project = await getProject(db, auth, id); // existence + data scope
+  if (project.ownerId === userId) return { userId, canRemove: false, reason: 'The project owner cannot be removed – change the owner on the Project tab' };
+  const [usage] = await memberUsage(db, id, [userId]);
+  return usage ?? { userId, canRemove: true, reason: null };
+}
+
 export async function projectReviews(db, auth, id) {
+  // the Update tab and the History → Comments list both read them
+  if (tabAccess(auth, 'update') === 'hidden' && tabAccess(auth, 'history') === 'hidden') needTab(auth, 'update', 'view', 'the project updates');
   await getProject(db, auth, id); // existence + data scope
   return listReviews(db, id);
 }
@@ -540,12 +865,14 @@ export async function projectReviews(db, auth, id) {
  * Either can be sent on its own; a new stage is applied to the project as well.
  */
 export async function addReview(db, auth, id, input) {
+  needTab(auth, 'update', 'edit', 'the project progress, stage or comments');
   const body = { ...input, comment: input.comment?.trim() ?? '', reviewDate: input.reviewDate ?? new Date().toISOString().slice(0, 10) };
   if (!body.comment && !body.completion?.length && !body.stageId) {
     throw badRequest('Add a comment or the % completed', [{ field: 'comment', message: 'is required without progress' }]);
   }
   const project = await getProject(db, auth, id);
   const stage = body.stageId && body.stageId !== project.stageId ? await resolveStage(db, body.stageId) : null;
+  if (!stage && !body.comment && !body.completion?.length) throw badRequest('Nothing has changed – update the stage, a % or write a comment');
   await db.tx(async (client) => {
     let changes = null;
     if (stage) {
@@ -559,7 +886,9 @@ export async function addReview(db, auth, id, input) {
       changes = { stage: { old: project.stageName, new: stage.name } };
       if (stage.status !== project.status) changes.status = { old: project.status, new: stage.status };
     }
-    await insertReview(client, auth, id, stage?.name ?? project.stageName, body);
+    // a stage change is logged by the system; progress and / or a comment make the user's entry
+    if (stage) await insertSystemLog(client, auth, id, stage.name, body.reviewDate, `Stage changed from ${project.stageName ?? 'no stage'} to ${stage.name}`);
+    if (body.comment || body.completion?.length) await insertReview(client, auth, id, stage?.name ?? project.stageName, body);
     const message = body.comment || (body.completion?.length ? 'Progress updated' : null);
     await writeAudit(client, { entity: 'projects', entityId: id, action: 'update', userId: auth.userId, message, changes });
   });

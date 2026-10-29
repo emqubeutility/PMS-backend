@@ -3,6 +3,44 @@ import { writeAudit, diff } from '../../utils/audit.js';
 import { badRequest, conflict, forbidden, notFound } from '../../utils/errors.js';
 import { escapeLike, WhereBuilder } from '../../utils/query.js';
 import { can, clearPermissionCache } from '../auth/auth-context.js';
+import { PROJECT_FIELDS, PROJECT_TABS, SCOPES } from '../projects/project-access.js';
+
+/** Project access of a role: { tabs: { users: 'hidden' … }, fields: { … } } – only the rules that are set. */
+async function loadAccessRules(db, roleId) {
+  const { rows } = await db.query(`SELECT scope, key, access FROM role_access_rules WHERE role_id = $1`, [roleId]);
+  const out = { tabs: {}, fields: {} };
+  for (const r of rows) {
+    if (r.scope === SCOPES.tab) out.tabs[r.key] = r.access;
+    if (r.scope === SCOPES.field) out.fields[r.key] = r.access;
+  }
+  return out;
+}
+
+/** Replaces the project access rules of a role (when sent). 'edit' is the default, so it is not stored. */
+async function saveAccessRules(client, roleId, rules) {
+  if (!rules) return;
+  const rows = [];
+  for (const [key, access] of Object.entries(rules.tabs ?? {})) {
+    const tab = PROJECT_TABS.find((t) => t.key === key);
+    if (!tab) throw badRequest(`Unknown project tab "${key}"`);
+    if (access !== 'edit' && !(access === 'view' && !tab.editable)) rows.push([SCOPES.tab, key, access]);
+  }
+  for (const [key, access] of Object.entries(rules.fields ?? {})) {
+    const field = PROJECT_FIELDS.find((f) => f.key === key);
+    if (!field) throw badRequest(`Unknown project field "${key}"`);
+    if (access === 'hidden' && field.required) throw badRequest(`${field.label} is required on every project – it can be View or Edit, not Hidden`);
+    if (access !== 'edit') rows.push([SCOPES.field, key, access]);
+  }
+  await client.query(`DELETE FROM role_access_rules WHERE role_id = $1 AND scope = ANY($2)`, [roleId, Object.values(SCOPES)]);
+  if (rows.length) {
+    await client.query(`INSERT INTO role_access_rules (role_id, scope, key, access) SELECT $1, * FROM unnest($2::text[], $3::text[], $4::text[])`, [
+      roleId,
+      rows.map((r) => r[0]),
+      rows.map((r) => r[1]),
+      rows.map((r) => r[2]),
+    ]);
+  }
+}
 
 const SORT_COLUMNS = { name: 'r.name', level: 'r.level', code: 'r.code' };
 const AUDIT_KEYS = ['name', 'code', 'level', 'role_type', 'data_scope', 'is_active'];
@@ -81,6 +119,7 @@ export async function getRole(db, id) {
   );
   return {
     ...toDto(rows[0]),
+    accessRules: await loadAccessRules(db, id),
     permissions: perms.rows.map((p) => ({
       menuId: p.menu_id,
       view: p.can_view,
@@ -158,6 +197,7 @@ export async function createRole(db, auth, body) {
       [code, body.name.trim(), body.level, body.roleType, body.dataScope, body.isActive, auth.userId],
     );
     await savePermissions(client, rows[0].id, body.permissions ?? [], auth.userId);
+    await saveAccessRules(client, rows[0].id, body.accessRules);
     await writeAudit(client, { entity: 'roles', entityId: rows[0].id, action: 'create', userId: auth.userId, message: `Role ${code} created` });
     return rows[0].id;
   });
@@ -187,6 +227,7 @@ export async function updateRole(db, auth, id, body) {
     );
     // Super Admin needs no permission rows; for everyone else they are replaced.
     if (level !== 0) await savePermissions(client, id, body.permissions ?? [], auth.userId);
+    if (level !== 0) await saveAccessRules(client, id, body.accessRules);
     await writeAudit(client, {
       entity: 'roles',
       entityId: id,

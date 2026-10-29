@@ -1,3 +1,4 @@
+import { PROJECT_FIELDS, PROJECT_TABS } from '../projects/project-access.js';
 import { PASSWORD_PATTERN } from '../../utils/crypto.js';
 
 const permissionFlags = {
@@ -34,6 +35,7 @@ export const sessionInfo = {
         username: { type: 'string' },
         email: { type: ['string', 'null'] },
         empCode: { type: ['string', 'null'] },
+        timeZone: { type: 'string', description: 'IANA zone the app shows dates and times in' },
         isSuperAdmin: { type: 'boolean' },
         role: {
           type: 'object',
@@ -49,6 +51,13 @@ export const sessionInfo = {
       },
     },
     permissions: { type: 'object', additionalProperties: permissionFlags },
+    projectAccess: {
+      type: 'object',
+      properties: {
+        tabs: { type: 'object', properties: Object.fromEntries(PROJECT_TABS.map((t) => [t.key, { type: 'string' }])) },
+        fields: { type: 'object', properties: Object.fromEntries(PROJECT_FIELDS.map((x) => [x.key, { type: 'string' }])) },
+      },
+    },
     menus: {
       type: 'array',
       items: { ...menuItem, properties: { ...menuItem.properties, children: { type: 'array', items: menuItem } } },

@@ -2,7 +2,7 @@
   "name": "emqube-pms-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "emQube PMS \u2013 REST API (Fastify + PostgreSQL)",
+  "description": "emQube PMS – REST API (Fastify + PostgreSQL)",
   "type": "module",
   "main": "src/server.js",
   "engines": {
@@ -20,7 +20,9 @@
     "predb:seed": "node scripts/check-node.cjs",
     "db:seed": "node --env-file-if-exists=.env scripts/seed.js",
     "db:setup": "npm run db:create && npm run db:migrate && npm run db:seed",
-    "test": "node --env-file-if-exists=.env --test test/"
+    "test": "node --env-file-if-exists=.env --test test/",
+    "db:import-pms": "node --env-file-if-exists=.env scripts/import-pms-data.js",
+    "db:cleanup-masters": "node --env-file-if-exists=.env scripts/cleanup-old-masters.js"
   },
   "dependencies": {
     "@fastify/cookie": "^11.1.3",

@@ -2,6 +2,7 @@ import { config } from '../../config/env.js';
 import { generateToken, hashPassword, sha256, verifyPassword } from '../../utils/crypto.js';
 import { AppError, badRequest, unauthorized } from '../../utils/errors.js';
 import { getUserMenus, getUserPermissions } from '../menus/menus.service.js';
+import { projectAccessOf } from '../projects/project-access.js';
 import { loadAuthContext } from './auth-context.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -118,10 +119,13 @@ export async function getSessionInfo(db, userIdOrAuth) {
       username: auth.username,
       email: auth.email,
       empCode: auth.empCode,
+      timeZone: auth.timeZone,
       role: auth.role,
       isSuperAdmin: auth.isSuperAdmin,
     },
     permissions,
+    // which project tabs / Project-tab fields the user sees or edits (Roles & Permissions → Project access)
+    projectAccess: projectAccessOf(auth),
     menus,
   };
 }

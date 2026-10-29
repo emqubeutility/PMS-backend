@@ -1,6 +1,5 @@
 import { paginationQuerySchema, pagedResponseSchema } from '../../utils/query.js';
 import { PROJECT_STATUSES } from './projects.service.js';
-import { ACCESS_LEVELS } from './projects.tabs.js';
 
 const tags = ['Projects'];
 const idParams = { type: 'object', required: ['id'], properties: { id: { type: 'integer', minimum: 1 } } };
@@ -22,11 +21,13 @@ const project = {
     projectTypeId: { type: 'integer' },
     typeName: { type: 'string' },
     isRetainerProject: { type: 'boolean' },
+    isBillable: { type: 'boolean' },
     startDate: { type: 'string' },
     endDate: { type: ['string', 'null'] },
     estimatedHours: { type: ['number', 'null'] },
     estimatedAmount: { type: ['number', 'null'] },
     estimatedAmountCurrency: { type: ['string', 'null'] },
+    quoteRatePerHour: { type: ['number', 'null'], description: "the division's quote rate per hour in the project's currency" },
     sharepointLink: { type: ['string', 'null'] },
     detail: { type: ['string', 'null'] },
     status: { type: 'string' },
@@ -57,16 +58,57 @@ const projectDetail = {
         properties: {
           id: { type: 'integer' },
           name: { type: 'string' },
-          accessLevel: { type: 'string' },
           costPerHour: { type: ['number', 'null'] },
           currency: { type: ['string', 'null'] },
           defaultRate: { type: ['number', 'null'] },
           defaultRateCurrency: { type: ['string', 'null'] },
           gradeName: { type: ['string', 'null'] },
+          gradeRate: { type: ['number', 'null'] },
+          gradeRateUsd: { type: ['number', 'null'] },
           teamName: { type: ['string', 'null'] },
           position: { type: ['string', 'null'] },
           loggedHours: { type: 'number' },
           isOwner: { type: 'boolean' },
+        },
+      },
+    },
+    canSeeCommercial: { type: 'boolean', description: 'the signed-in user may see the Commercial tab' },
+    commercial: {
+      type: ['object', 'null'],
+      description: 'Commercial tab (null unless canSeeCommercial)',
+      properties: {
+        currency: { type: 'string', description: "the project's currency – every amount of the tab is in it" },
+        projectCurrency: { type: 'string' },
+        projectAmount: { type: ['number', 'null'], description: 'total amount in the project currency' },
+        usdRate: { type: ['number', 'null'], description: '1 unit of the project currency in USD (used when a cost is only known in another currency)' },
+        missingRates: { type: 'array', items: { type: 'string' }, description: 'currencies without a USD rate (Parameters → CURRENCY)' },
+        totalValue: { type: ['number', 'null'] },
+        outsourceValue: { type: ['number', 'null'] },
+        purchaseValue: { type: ['number', 'null'] },
+        otherValue: { type: ['number', 'null'] },
+        membersValue: { type: 'number' },
+        totalCost: { type: 'number' },
+        netValue: { type: ['number', 'null'], description: 'total project value − total cost' },
+        members: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'integer' },
+              name: { type: 'string' },
+              isOwner: { type: 'boolean' },
+              gradeName: { type: ['string', 'null'] },
+              teamName: { type: ['string', 'null'] },
+              costPerHour: { type: ['number', 'null'] },
+              gradeRate: { type: ['number', 'null'], description: "the grade's cost per hour in the project currency" },
+              gradeRateViaUsd: { type: 'boolean', description: 'the grade has no cost in the project currency: it was taken in USD and converted' },
+              defaultRate: { type: ['number', 'null'] },
+              rateSource: { type: ['string', 'null'], enum: ['project', 'grade', 'grade_usd', 'own', null] },
+              rate: { type: ['number', 'null'] },
+              loggedHours: { type: 'number' },
+              value: { type: ['number', 'null'] },
+            },
+          },
         },
       },
     },
@@ -87,6 +129,9 @@ const projectDetail = {
           effortPercentage: { type: 'number' },
           hours: { type: ['number', 'null'] },
           actualHours: { type: 'number' },
+          reportedPercentage: { type: 'number', description: '% complete reported for the group on the Update tab (latest review)' },
+          locked: { type: 'boolean', description: 'work has started in the group (time logged, tasks in progress / completed): the effort cannot be 0%' },
+          lockReason: { type: ['string', 'null'] },
         },
       },
     },
@@ -106,6 +151,7 @@ const projectFields = {
   estimatedAmountCurrency: { anyOf: [{ type: 'string', pattern: '^[A-Z]{3}$' }, { type: 'null' }] },
   sharepointLink: { anyOf: [{ type: 'string', format: 'uri', maxLength: 500 }, { type: 'string', maxLength: 0 }, { type: 'null' }] },
   isRetainerProject: { type: 'boolean' },
+  isBillable: { type: 'boolean' },
   detail: { type: ['string', 'null'], maxLength: 10000 },
   stageId: { type: 'integer', minimum: 1, description: 'project stage (lookups PROJECT_STAGE); defaults to Draft' },
 };
@@ -225,7 +271,8 @@ export const createProjectSchema = {
     properties: {
       ...projectFields,
       isRetainerProject: { type: 'boolean', default: false },
-      estimatedAmountCurrency: { ...projectFields.estimatedAmountCurrency, default: 'INR' },
+      isBillable: { type: 'boolean', default: true },
+      estimatedAmountCurrency: { ...projectFields.estimatedAmountCurrency, default: 'AED' },
     },
   },
   response: { 201: projectDetail },
@@ -243,18 +290,18 @@ export const updateProjectSchema = {
       ...projectFields,
       members: {
         type: 'array',
-        description: 'Users tab – replaces the members; the owner always stays with edit access',
+        description: 'Users tab – replaces the members; the owner always stays (what members may do comes from their role)',
         items: {
           type: 'object',
           additionalProperties: false,
-          required: ['userId', 'accessLevel'],
+          required: ['userId'],
           properties: {
             userId: { type: 'integer', minimum: 1 },
-            accessLevel: { type: 'string', enum: ACCESS_LEVELS },
             costPerHour: { type: ['number', 'null'], minimum: 0 },
           },
         },
       },
+      confirmRemove: { type: 'boolean', description: 'remove task groups whose plan tasks are all completed' },
       estimates: {
         type: 'array',
         description: 'Estimate tab – % of effort per task group; rows above 0% must total 100',
@@ -279,12 +326,81 @@ const review = {
     stage: { type: ['string', 'null'] },
     reviewDate: { type: 'string' },
     comment: { type: 'string' },
+    isSystem: { type: 'boolean', description: 'log written by the system, e.g. stage changed' },
     reviewerName: { type: ['string', 'null'] },
     createdAt: { type: 'string', format: 'date-time' },
     overall: { type: 'integer' },
     groups: {
       type: 'array',
       items: { type: 'object', properties: { taskGroupId: { type: 'integer' }, completionPercentage: { type: 'number' } } },
+    },
+  },
+};
+
+const money = { type: ['number', 'null'], minimum: 0, maximum: 999999999999 };
+export const updateCommercialSchema = {
+  tags,
+  summary: "Commercial tab: outsource / purchase / other values and the members' cost per hour (project manager only)",
+  params: idParams,
+  body: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      outsourceValue: money,
+      purchaseValue: money,
+      otherValue: money,
+      members: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['userId'],
+          properties: { userId: { type: 'integer', minimum: 1 }, costPerHour: { type: ['number', 'null'], minimum: 0 } },
+        },
+      },
+    },
+  },
+  response: { 200: projectDetail },
+};
+
+export const tasksSchema = {
+  tags,
+  summary: 'Tasks tab: the project tasks with people, timeline, subtasks and status (+ skills and matching members)',
+  params: idParams,
+  response: {
+    200: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer' },
+          name: { type: 'string' },
+          description: { type: ['string', 'null'] },
+          status: { type: 'string' },
+          priority: { type: ['string', 'null'] },
+          taskGroupName: { type: ['string', 'null'] },
+          taskTypeName: { type: ['string', 'null'] },
+          ownerId: { type: ['integer', 'null'] },
+          ownerName: { type: ['string', 'null'] },
+          assignedTo: { type: ['integer', 'null'] },
+          assignedToName: { type: ['string', 'null'] },
+          plannedStart: { type: ['string', 'null'], format: 'date-time' },
+          plannedEnd: { type: ['string', 'null'], format: 'date-time' },
+          isContinuous: { type: 'boolean' },
+          completedOn: { type: ['string', 'null'] },
+          isOverdue: { type: 'boolean' },
+          subtaskCount: { type: 'integer' },
+          subtaskDone: { type: 'integer' },
+          skills: { type: 'array', items: { type: 'object', properties: { id: { type: 'integer' }, name: { type: 'string' } } } },
+          matches: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: { id: { type: 'integer' }, name: { type: 'string' }, roleName: { type: 'string' }, skills: { type: 'array', items: { type: 'string' } } },
+            },
+          },
+        },
+      },
     },
   },
 };
@@ -298,7 +414,7 @@ export const reviewsSchema = {
 
 export const addReviewSchema = {
   tags,
-  summary: 'Add progress (stage, review date, % completed per task group) and/or a comment',
+  summary: 'Update: stage (logged by the system when it changes), stage date, % completed per task group and / or a comment',
   params: idParams,
   body: {
     type: 'object',

@@ -1,13 +1,13 @@
 import { SCREENS } from '../../config/menus.js';
 import { badRequest } from '../../utils/errors.js';
+import { todayIn } from '../../utils/time.js';
 import * as service from './timesheets.service.js';
 import * as schemas from './timesheets.schemas.js';
 
-/** Time can't be logged for a future day. "Today" is taken at UTC+14 so every user time zone's today is allowed. */
+/** Time can't be logged for a future day – "today" in the user's time zone. */
 function notInFuture(req) {
   const d = req.body?.workDate;
-  const latestToday = new Date(Date.now() + 14 * 3600 * 1000).toISOString().slice(0, 10);
-  if (d && d > latestToday) {
+  if (d && d > todayIn(req.auth.timeZone)) {
     throw badRequest('You cannot log time for a future date', [{ field: 'workDate', message: 'is in the future' }]);
   }
 }
@@ -27,6 +27,8 @@ export default async function timesheetsRoutes(fastify) {
   fastify.get('/options', { schema: schemas.optionsSchema, preHandler: authorize(SCREENS.TIMESHEET, 'view') }, (req) =>
     service.timesheetOptions(db, req.auth),
   );
+
+  fastify.get('/meta', { schema: schemas.metaSchema, preHandler: authorize(SCREENS.TIMESHEET, 'view') }, (req) => service.timesheetMeta(db, req.auth));
 
   fastify.get('/projects', { schema: schemas.filterProjectsSchema, preHandler: authorize(SCREENS.TIMESHEET, 'view') }, (req) =>
     service.filterProjects(db, req.auth),

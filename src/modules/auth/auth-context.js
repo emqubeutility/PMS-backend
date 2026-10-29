@@ -3,10 +3,27 @@
 
 const CACHE_TTL_MS = 60_000;
 const permissionCache = new Map(); // roleId -> { at, permissions }
+const accessCache = new Map(); // roleId -> { at, access }
 
 export function clearPermissionCache(roleId) {
-  if (roleId === undefined) permissionCache.clear();
-  else permissionCache.delete(Number(roleId));
+  if (roleId === undefined) {
+    permissionCache.clear();
+    accessCache.clear();
+  } else {
+    permissionCache.delete(Number(roleId));
+    accessCache.delete(Number(roleId));
+  }
+}
+
+/** Access rules of a role: { project_tab: { users: 'hidden' … }, project_field: { … } } (see role_access_rules). */
+async function loadRoleAccess(db, roleId) {
+  const hit = accessCache.get(roleId);
+  if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.access;
+  const { rows } = await db.query(`SELECT scope, key, access FROM role_access_rules WHERE role_id = $1`, [roleId]);
+  const access = {};
+  for (const r of rows) (access[r.scope] ??= {})[r.key] = r.access;
+  accessCache.set(roleId, { at: Date.now(), access });
+  return access;
 }
 
 async function loadRolePermissions(db, roleId) {
@@ -38,7 +55,7 @@ async function loadRolePermissions(db, roleId) {
 
 export async function loadAuthContext(db, userId) {
   const { rows } = await db.query(
-    `SELECT u.id, u.name, u.username, u.email, u.emp_code, u.is_active, u.customer_id, u.vendor_id,
+    `SELECT u.id, u.name, u.username, u.email, u.emp_code, u.is_active, u.customer_id, u.vendor_id, u.time_zone,
             r.id AS role_id, r.code AS role_code, r.name AS role_name, r.level AS role_level,
             r.data_scope, r.role_type, r.is_active AS role_active
        FROM users u
@@ -56,6 +73,7 @@ export async function loadAuthContext(db, userId) {
     username: u.username,
     email: u.email,
     empCode: u.emp_code,
+    timeZone: u.time_zone, // dates / times are shown and "today" is counted in this zone
     isActive: u.is_active && u.role_active,
     customerId: u.customer_id,
     vendorId: u.vendor_id,
@@ -69,6 +87,7 @@ export async function loadAuthContext(db, userId) {
     },
     isSuperAdmin,
     permissions: isSuperAdmin ? {} : await loadRolePermissions(db, u.role_id),
+    access: isSuperAdmin ? {} : await loadRoleAccess(db, u.role_id),
   };
 }
 

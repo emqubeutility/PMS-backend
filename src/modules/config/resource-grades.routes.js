@@ -1,11 +1,16 @@
 import { SCREENS } from '../../config/menus.js';
 import { writeAudit } from '../../utils/audit.js';
 import { badRequest, conflict, isReferenceError, notFound } from '../../utils/errors.js';
+import { exact } from '../../utils/number.js';
 import { escapeLike, paginationQuerySchema, pagedResponseSchema, WhereBuilder } from '../../utils/query.js';
 
 /*
- * Resource grades (grade = lookup type GRADE, optionally per team) with their cost-per-hour history.
+ * Resource grades (one per grade = lookup type GRADE) with their cost-per-hour history.
  * Users point at a resource grade; the user form pre-fills the hourly rate from the current cost.
+ *
+ * Cost periods, per currency: they follow each other without a gap or overlap (next from = previous
+ * to + 1 day) and the latest one is always open-ended ("still running"), so there is always a current price.
+ * The cost in USD uses the currency's USD rate (Parameters → CURRENCY).
  */
 
 const tags = ['Resource Grades'];
@@ -29,7 +34,6 @@ const body = {
   additionalProperties: false,
   properties: {
     gradeId: { type: 'integer', minimum: 1 },
-    teamId: { type: ['integer', 'null'], minimum: 1 },
     costs: { type: 'array', items: cost, default: [], maxItems: 100 },
   },
 };
@@ -39,11 +43,10 @@ const item = {
     id: { type: 'integer' },
     gradeId: { type: 'integer' },
     gradeName: { type: 'string' },
-    teamId: { type: ['integer', 'null'] },
-    teamName: { type: ['string', 'null'] },
     userCount: { type: 'integer' },
     currentCost: { type: ['number', 'null'] },
     currentCurrency: { type: ['string', 'null'] },
+    currentCostUsd: { type: ['number', 'null'], description: 'current cost per hour in USD' },
     updatedAt: { type: 'string', format: 'date-time' },
   },
 };
@@ -55,7 +58,13 @@ const detail = {
       type: 'array',
       items: {
         type: 'object',
-        properties: { costPerHour: { type: 'number' }, currency: { type: 'string' }, fromDate: { type: 'string' }, toDate: { type: ['string', 'null'] } },
+        properties: {
+          costPerHour: { type: 'number' },
+          currency: { type: 'string' },
+          fromDate: { type: 'string' },
+          toDate: { type: ['string', 'null'] },
+          costPerHourUsd: { type: ['number', 'null'] },
+        },
       },
     },
   },
@@ -70,23 +79,22 @@ export const CURRENT_COST = `
      LIMIT 1) cc ON true`;
 
 const SELECT = `
-  SELECT x.id, x.grade_id, g.name AS grade_name, g.display_order, x.team_id, t.name AS team_name, x.updated_at,
+  SELECT x.id, x.grade_id, g.name AS grade_name, g.display_order, x.updated_at,
          (SELECT count(*)::int FROM users u WHERE u.resource_grade_id = x.id) AS user_count,
-         cc.cost_per_hour AS current_cost, trim(cc.currency) AS current_currency
+         cc.cost_per_hour AS current_cost, trim(cc.currency) AS current_currency,
+         (SELECT r.usd_rate FROM v_currency_usd_rates r WHERE r.code = trim(cc.currency) LIMIT 1) AS current_usd_rate
     FROM resource_grades x
     JOIN lookups g ON g.id = x.grade_id
-    LEFT JOIN teams t ON t.id = x.team_id
     ${CURRENT_COST}`;
 
 const toDto = (r) => ({
   id: r.id,
   gradeId: r.grade_id,
   gradeName: r.grade_name,
-  teamId: r.team_id,
-  teamName: r.team_name,
   userCount: r.user_count,
   currentCost: r.current_cost,
   currentCurrency: r.current_currency,
+  currentCostUsd: r.current_usd_rate == null || r.current_cost == null ? null : exact(r.current_cost * r.current_usd_rate),
   updatedAt: r.updated_at,
 });
 
@@ -94,34 +102,57 @@ async function getOne(db, id) {
   const { rows } = await db.query(`SELECT * FROM (${SELECT}) s WHERE s.id = $1`, [id]);
   if (!rows[0]) throw notFound('Resource grade');
   const costs = await db.query(
-    `SELECT cost_per_hour, trim(currency) AS currency, from_date, to_date FROM resource_grade_costs
+    `SELECT c.cost_per_hour, trim(c.currency) AS currency, c.from_date, c.to_date,
+            (SELECT r.usd_rate FROM v_currency_usd_rates r WHERE r.code = trim(c.currency) LIMIT 1) AS usd_rate
+       FROM resource_grade_costs c
       WHERE resource_grade_id = $1 ORDER BY from_date DESC`,
     [id],
   );
   return {
     ...toDto(rows[0]),
-    costs: costs.rows.map((c) => ({ costPerHour: c.cost_per_hour, currency: c.currency, fromDate: c.from_date, toDate: c.to_date })),
+    costs: costs.rows.map((c) => ({
+      costPerHour: c.cost_per_hour,
+      currency: c.currency,
+      fromDate: c.from_date,
+      toDate: c.to_date,
+      costPerHourUsd: c.usd_rate == null ? null : exact(c.cost_per_hour * c.usd_rate),
+    })),
   };
 }
 
-/** Grade must be a GRADE lookup, unique per team; cost periods must be valid and must not overlap. */
+const nextDay = (iso) => {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+};
+
+/** Grade must be a GRADE lookup used once; per currency the cost periods must follow each other without gaps. */
 async function validate(db, b, id) {
   const { rows } = await db.query(`SELECT 1 FROM lookups WHERE id = $1 AND type = 'GRADE'`, [b.gradeId]);
   if (!rows.length) throw badRequest('Select a grade (Parameters → GRADE)', [{ field: 'gradeId', message: 'is not a grade' }]);
-  const dup = await db.query(
-    `SELECT 1 FROM resource_grades WHERE grade_id = $1 AND team_id IS NOT DISTINCT FROM $2 AND id IS DISTINCT FROM $3`,
-    [b.gradeId, b.teamId ?? null, id],
-  );
-  if (dup.rowCount) throw conflict('This grade already exists for the selected team');
+  const dup = await db.query(`SELECT 1 FROM resource_grades WHERE grade_id = $1 AND id IS DISTINCT FROM $2`, [b.gradeId, id]);
+  if (dup.rowCount) throw conflict('This grade already exists – edit its cost history instead');
 
-  const periods = [...b.costs].sort((a, c) => a.fromDate.localeCompare(c.fromDate));
-  periods.forEach((p, i) => {
-    if (p.toDate && p.toDate < p.fromDate) throw badRequest(`Cost from ${p.fromDate}: the end date is before the start date`);
-    const next = periods[i + 1];
-    if (next && (!p.toDate || p.toDate >= next.fromDate)) {
-      throw badRequest(`Cost periods overlap (${p.fromDate} and ${next.fromDate}). End the earlier period before the next one starts.`);
-    }
-  });
+  const byCurrency = new Map();
+  for (const c of b.costs) byCurrency.set(c.currency, [...(byCurrency.get(c.currency) ?? []), c]);
+  for (const c of b.costs) {
+  }
+  for (const [currency, list] of byCurrency) {
+    const periods = [...list].sort((a, c) => a.fromDate.localeCompare(c.fromDate));
+    periods.forEach((p, i) => {
+      if (p.toDate && p.toDate < p.fromDate) throw badRequest(`${currency} cost from ${p.fromDate}: the end date is before the start date`);
+      const next = periods[i + 1];
+      // there must always be a current price: the latest period of a currency never ends
+      if (!next) {
+        if (p.toDate) throw badRequest(`${currency}: the latest cost (from ${p.fromDate}) must be still running – add a new period to change the price`);
+        return;
+      }
+      if (!p.toDate) throw badRequest(`${currency}: only the latest cost period can be still running (from ${p.fromDate})`);
+      if (next.fromDate !== nextDay(p.toDate)) {
+        throw badRequest(`${currency}: the cost from ${next.fromDate} must start on ${nextDay(p.toDate)}, the day after the previous period ends – no gaps or overlaps`);
+      }
+    });
+  }
 }
 
 async function saveCosts(client, id, costs, userId) {
@@ -144,7 +175,7 @@ export default async function resourceGradesRoutes(fastify) {
       schema: {
         tags,
         summary: 'List resource grades',
-        querystring: { type: 'object', properties: { ...paginationQuerySchema, teamId: { type: 'string' } } },
+        querystring: { type: 'object', properties: { ...paginationQuerySchema } },
         response: { 200: pagedResponseSchema(item) },
       },
       preHandler: authorize(SCREENS.RESOURCE_GRADES, 'view'),
@@ -152,12 +183,12 @@ export default async function resourceGradesRoutes(fastify) {
     async (req) => {
       const q = req.query;
       const where = new WhereBuilder();
-      if (q.search) where.add(`(s.grade_name ILIKE $? OR s.team_name ILIKE $?)`, `%${escapeLike(q.search)}%`, `%${escapeLike(q.search)}%`);
+      if (q.search) where.add(`s.grade_name ILIKE $?`, `%${escapeLike(q.search)}%`);
       const limit = where.param(q.pageSize);
       const offset = where.param((q.page - 1) * q.pageSize);
       const { rows } = await db.query(
         `SELECT s.*, count(*) OVER()::int AS total FROM (${SELECT}) s ${where.toSql()}
-          ORDER BY s.team_name NULLS FIRST, s.display_order, s.grade_name LIMIT ${limit} OFFSET ${offset}`,
+          ORDER BY s.display_order, s.grade_name LIMIT ${limit} OFFSET ${offset}`,
         where.params,
       );
       return { items: rows.map(toDto), total: rows[0]?.total ?? 0, page: q.page, pageSize: q.pageSize };
@@ -176,8 +207,8 @@ export default async function resourceGradesRoutes(fastify) {
       await validate(db, b, null);
       const id = await db.tx(async (client) => {
         const { rows } = await client.query(
-          `INSERT INTO resource_grades (grade_id, team_id, created_by, updated_by) VALUES ($1, $2, $3, $3) RETURNING id`,
-          [b.gradeId, b.teamId ?? null, req.auth.userId],
+          `INSERT INTO resource_grades (grade_id, created_by, updated_by) VALUES ($1, $2, $2) RETURNING id`,
+          [b.gradeId, req.auth.userId],
         );
         await saveCosts(client, rows[0].id, b.costs, req.auth.userId);
         await writeAudit(client, { entity: 'resource_grades', entityId: rows[0].id, action: 'create', userId: req.auth.userId });
@@ -197,7 +228,7 @@ export default async function resourceGradesRoutes(fastify) {
       if (!rowCount) throw notFound('Resource grade');
       await validate(db, b, id);
       await db.tx(async (client) => {
-        await client.query(`UPDATE resource_grades SET grade_id = $2, team_id = $3, updated_by = $4 WHERE id = $1`, [id, b.gradeId, b.teamId ?? null, req.auth.userId]);
+        await client.query(`UPDATE resource_grades SET grade_id = $2, updated_by = $3 WHERE id = $1`, [id, b.gradeId, req.auth.userId]);
         await saveCosts(client, id, b.costs, req.auth.userId);
         await writeAudit(client, { entity: 'resource_grades', entityId: id, action: 'update', userId: req.auth.userId, message: 'Grade and cost history saved' });
       });

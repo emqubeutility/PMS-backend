@@ -32,6 +32,6 @@ export default async function menusRoutes(fastify) {
       },
       preHandler: fastify.authorize(SCREENS.ROLES, 'view'),
     },
-    () => getMenuTree(fastify.db),
+    () => getMenuTree(fastify.db, { includeHidden: true }), // the role permission grid lists hidden screens too
   );
 }

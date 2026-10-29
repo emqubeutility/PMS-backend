@@ -1,3 +1,4 @@
+import { PROJECT_FIELDS, PROJECT_TABS } from '../projects/project-access.js';
 import { paginationQuerySchema, pagedResponseSchema } from '../../utils/query.js';
 
 const tags = ['Roles & Permissions'];
@@ -34,9 +35,15 @@ const role = {
   },
 };
 
+// Project access: tab / field → 'hidden' | 'view' | 'edit' (missing = edit)
+// every key named (the API strips properties a schema does not list)
+const level = { type: 'string', enum: ['hidden', 'view', 'edit'] };
+const accessMap = (list) => ({ type: 'object', properties: Object.fromEntries(list.map((x) => [x.key, level])) });
+const accessRules = { type: 'object', additionalProperties: false, properties: { tabs: accessMap(PROJECT_TABS), fields: accessMap(PROJECT_FIELDS) } };
+
 const roleWithPermissions = {
   ...role,
-  properties: { ...role.properties, permissions: { type: 'array', items: permission } },
+  properties: { ...role.properties, permissions: { type: 'array', items: permission }, accessRules },
 };
 
 const roleBody = {
@@ -51,6 +58,8 @@ const roleBody = {
     dataScope: { type: 'string', enum: ['all', 'team', 'own', 'customer', 'vendor'], default: 'own' },
     isActive: { type: 'boolean', default: true },
     permissions: { type: 'array', items: permission, default: [] },
+    // which project tabs / Project-tab fields the role sees or edits; only changed when sent
+    accessRules,
   },
 };
 
