@@ -58,9 +58,8 @@ const item = {
   },
 };
 
-// a task type is "in use" when timesheets, project tasks or task templates point at it
-const IN_USE = (alias) => `(EXISTS (SELECT 1 FROM timesheets ts WHERE ts.task_type_id = ${alias}.id)
-                       OR EXISTS (SELECT 1 FROM tasks tk WHERE tk.task_type_id = ${alias}.id)
+// a task type is "in use" when project tasks or task templates point at it
+const IN_USE = (alias) => `(EXISTS (SELECT 1 FROM tasks tk WHERE tk.task_type_id = ${alias}.id)
                        OR EXISTS (SELECT 1 FROM project_type_task_templates tt WHERE tt.task_type_id = ${alias}.id))`;
 
 const SELECT = `

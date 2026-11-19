@@ -107,7 +107,7 @@ const LIST_SELECT = `
          (SELECT count(*)::int FROM projects p WHERE p.project_type_id = x.id) AS project_count,
          COALESCE((SELECT json_agg(json_build_object('taskGroupName', g.name, 'effortPercentage', e.effort_percentage)
                                    ORDER BY e.effort_percentage DESC, g.name)
-                     FROM project_type_default_estimates e JOIN task_groups g ON g.id = e.task_group_id
+                     FROM project_type_effort_defaults e JOIN task_groups g ON g.id = e.task_group_id
                     WHERE e.project_type_id = x.id), '[]') AS split,
          COALESCE((SELECT json_agg(json_build_object('name', tg.name, 'count', tg.n) ORDER BY tg.n DESC, tg.name)
                      FROM (SELECT g.name, count(*)::int AS n FROM project_type_task_templates t JOIN task_groups g ON g.id = t.task_group_id
@@ -137,7 +137,7 @@ async function getOne(db, id) {
       `SELECT t.task_group_id, g.name AS group_name, t.task_type_id, tt.name AS type_name, t.task_title,
               t.description, t.effort_percentage, t.manager_approval, t.client_approval,
               COALESCE((SELECT json_agg(json_build_object('id', l.id, 'name', l.name) ORDER BY l.display_order, l.name)
-                          FROM project_type_task_template_roles r JOIN lookups l ON l.id = r.role_id
+                          FROM project_type_task_template_roles r JOIN parameter_values l ON l.id = r.role_id
                          WHERE r.task_template_id = t.id), '[]') AS roles
          FROM project_type_task_templates t
          JOIN task_groups g ON g.id = t.task_group_id JOIN task_types tt ON tt.id = t.task_type_id
@@ -145,7 +145,7 @@ async function getOne(db, id) {
       [id],
     ),
     db.query(
-      `SELECT e.task_group_id, g.name, e.effort_percentage FROM project_type_default_estimates e
+      `SELECT e.task_group_id, g.name, e.effort_percentage FROM project_type_effort_defaults e
          JOIN task_groups g ON g.id = e.task_group_id WHERE e.project_type_id = $1 ORDER BY e.effort_percentage DESC, g.name`,
       [id],
     ),
@@ -208,7 +208,7 @@ async function validate(db, b) {
     });
     const roleIds = [...new Set(b.templates.flatMap((t) => t.roleIds ?? []))];
     if (roleIds.length) {
-      const { rows: roles } = await db.query(`SELECT id FROM lookups WHERE id = ANY($1) AND type = 'SKILL'`, [roleIds]);
+      const { rows: roles } = await db.query(`SELECT id FROM parameter_values WHERE id = ANY($1) AND type = 'SKILL'`, [roleIds]);
       if (roles.length !== roleIds.length) throw badRequest('One of the selected skills does not exist (Parameters → SKILL)');
     }
   }
@@ -216,7 +216,7 @@ async function validate(db, b) {
 
 async function saveChildren(client, id, b, userId) {
   if (b.templates) await client.query(`DELETE FROM project_type_task_templates WHERE project_type_id = $1`, [id]);
-  if (b.estimates) await client.query(`DELETE FROM project_type_default_estimates WHERE project_type_id = $1`, [id]);
+  if (b.estimates) await client.query(`DELETE FROM project_type_effort_defaults WHERE project_type_id = $1`, [id]);
   if (b.templates?.length) {
     const T = b.templates;
     const { rows } = await client.query(
@@ -248,7 +248,7 @@ async function saveChildren(client, id, b, userId) {
   }
   if (b.estimates?.length) {
     await client.query(
-      `INSERT INTO project_type_default_estimates (project_type_id, task_group_id, effort_percentage, created_by, updated_by)
+      `INSERT INTO project_type_effort_defaults (project_type_id, task_group_id, effort_percentage, created_by, updated_by)
        SELECT $1, g, pct, $4, $4 FROM unnest($2::bigint[], $3::numeric[]) AS u(g, pct)`,
       [id, b.estimates.map((e) => e.taskGroupId), b.estimates.map((e) => e.effortPercentage), userId],
     );
